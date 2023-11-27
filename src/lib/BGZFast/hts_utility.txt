@@ -1,0 +1,252 @@
+NAME
+    BGZFast::hts_utility - Convenient functions for using HTS bins
+
+SYNOPSIS
+      use BGZFast::hts_utility;
+
+      # Get smallest bin completely encapsulating region
+      my $bin = BGZFast::hts_utility::reg2bin($start, $end);
+
+      # Get all regions overlapping a region
+      my @bins = BGZFast::hts_utility::reg2bins($start, $end);
+
+      # Get region for a bin
+      ($start, $end) = BGZFast::hts_utility::bin2reg($bin);
+
+      # Get immediate parent of a bin
+      my $parent = BGZFast::hts_utility::bin2paren($bin);
+
+DESCRIPTION
+    BGZFast::hts_utility provides convenient functions for using HTS bins.
+
+BASICS OF HTS BIN USAGE AND CALCULATION
+    BGZFast::hts_utility calculates bins and relationships among bins. The
+    binning scheme used is described in the BAM Index format documentation.
+    Positions and regions used for binning are zero based with a closed-open
+    interval [start,end). This means the start is included but the end is
+    not. Basic theory is as follows:
+
+      #Bin levels are based on bit shifts (max 29 and min 14)
+      29, 26, 23, 20, 17, 14
+
+      #Bin count shifts for each level are calculated as so
+      shift = ((1<< 0)-1)/7 =    0
+      shift = ((1<< 3)-1)/7 =    1
+      shift = ((1<< 6)-1)/7 =    9
+      shift = ((1<< 9)-1)/7 =   73
+      shift = ((1<<12)-1)/7 =  585
+      shift = ((1<<15)-1)/7 = 4681
+
+      #Binning at each level is done by bit shifting then count shifting
+      bin = (pos>>bit) + shift
+      bin = (pos>>29)  +    0
+      bin = (pos>>26)  +    1
+      bin = (pos>>23)  +    9
+      bin = (pos>>20)  +   73
+      bin = (pos>>17)  +  585
+      bin = (pos>>14)  + 4681
+
+      #Note that linear index bins are 2^14 bytes wide and never shifted
+      lin = (pos>>14)
+
+SEE ALSO
+    BGZFast::tbi_manipulator
+
+AUTHOR
+    Carson Holt <carson.holt@genetics.utah.edu>.
+
+    Copyright (c) 2017 University of Utah.
+
+    This library is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself. See DISCLAIMER.txt for disclaimers
+    of warranty.
+
+APPENDIX
+    The rest of the documentation details each of the object methods.
+    Internal methods are usually preceded with a _
+
+
+    For simple access, the following methods are provided:
+
+  pseudo_bin
+     Title   : pseudo_bin
+     Usage   : my $pseudo = BGZFast::hts_utility::pseudo_bin();
+     Function: Get the pseudo bin number. This occurs two bins beyond the
+               maximum possible bin number.
+     Returns : Pseudo bin number
+     Args    : None
+
+  min_binsize
+     Title   : min_binsize
+     Usage   : my $min = BGZFast::hts_utility::min_binsize();
+     Function: Get the minimum size of a standard bin. Corresponds to size
+               of bin 4681 and above.
+     Returns : Minimum size of a standard bin
+     Args    : None
+
+  max_binsize
+     Title   : max_binsize
+     Usage   : my $max = BGZFast::hts_utility::max_binsize();
+     Function: Get the maximum size of a standard bin. Corresponds to size
+               of bin 0.
+     Returns : Maximum size of a standard bin
+     Args    : None
+
+  bin2bit
+     Title   : bin2bit
+     Usage   : my $bit = BGZFast::hts_utility::bin2bit($bin);
+     Function: Get the bit shift used to calculate bin size/width (log2 of
+               bin size/width)
+     Returns : Bit shift number
+     Args    : Bin number
+
+  bin2size
+     Title   : bin2size
+     Usage   : my $bsize = BGZFast::hts_utility::bin2size($bin);
+     Function: Get the size/width of a goiven bin. For example bin 9 has a
+               width of 8Mb and bin 4681 has a width of 16kb
+     Returns : The bin size/width
+     Args    : Bin number
+
+  bin2shift
+     Title   : bin2shift
+     Usage   : my $bshift = BGZFast::hts_utility::bin2shift($bin);
+     Function: Get the bin shift added for a given bin. For example 8Mb bins
+               start at 9 and all 16kb bins start at 4681  
+     Returns : The bin count shift added to the given bin
+     Args    : Bin number
+
+  pos2lin
+     Title   : pos2lin
+     Usage   : my $lin = BGZFast::hts_utility::pos2lin($pos);
+     Function: Get linear index bin containing position.
+     Returns : Linear index bin number
+     Args    : Position
+
+  reg2lins
+     Title   : reg2lins
+     Usage   : my @lins = BGZFast::hts_utility::reg2lins($start, $end);
+     Function: Get all linear index bins overlapping a region
+     Returns : Linear index bin numbers
+     Args    : Start and end
+
+  pos2bin
+     Title   : pos2bin
+     Usage   : my $bin = BGZFast::hts_utility::pos2bin($pos);
+     Function: Get smallest standard bin containing position. Will always be
+               a value greater than 4680.
+     Returns : Bin number
+     Args    : Position
+
+  pos2bins
+     Title   : pos2bins
+     Usage   : my @bins = BGZFast::hts_utility::pos2bins($pos);
+     Function: Get all standard bins overlapping a position.
+     Returns : Bin numbers
+     Args    : Position
+
+  reg2bin
+     Title   : reg2bin
+     Usage   : my $bin = BGZFast::hts_utility::reg2bin($start, $end);
+     Function: Get smallest standard bin fully containing a region
+     Returns : Bin number
+     Args    : Start and end
+
+  reg2bins
+     Title   : reg2bins
+     Usage   : my @bins = BGZFast::hts_utility::reg2bins($start, $end);
+     Function: Get all standard bins overlapping a region
+     Returns : Bin numbers
+     Args    : Start and end
+
+  lin2bin
+     Title   : lin2bin
+     Usage   : my $bin = BGZFast::hts_utility::lin2bin($lin);
+     Function: Get the standard bin equivilent to linear index bin.
+     Returns : Bin number
+     Args    : Linear index bin
+
+  bin2lin
+     Title   : bin2lin
+     Usage   : my $lin = BGZFast::hts_utility::bin2lin($bin);
+     Function: Get the linear index bin equivilent to standard bin. Only
+               works for bin numbers higher than 4680.
+     Returns : Linear index bin
+     Args    : Bin number
+
+  bin2lins
+     Title   : bin2lins
+     Usage   : my @lins = BGZFast::hts_utility::bin2lins($bin);
+     Function: Get all linear index bins overlapping standard bins
+     Returns : Linear index bins
+     Args    : Bin number
+
+  bin2beg
+     Title   : bin2beg
+     Usage   : my $start = BGZFast::hts_utility::bin2beg($bin);
+     Function: Get the region start position corresponding to a bin
+     Returns : Start
+     Args    : Bin number
+
+  bin2end
+     Title   : bin2end
+     Usage   : my $end = BGZFast::hts_utility::bin2end($bin);
+     Function: Get the region end position corresponding to a bin
+     Returns : End
+     Args    : Bin number
+
+  bin2reg
+     Title   : bin2reg
+     Usage   : my ($start, $end) = BGZFast::hts_utility::bin2reg($bin);
+     Function: Get the region [start, end) corresponding to a bin
+     Returns : Start and end
+     Args    : Bin number
+
+  bin2parent
+     Title   : bin2parent
+     Usage   : my $parent = BGZFast::hts_utility::bin2parent($bin);
+     Function: Identify immediate parent of a bin
+     Returns : Bin numbers of parent
+     Args    : Bin number
+
+  bin2parents
+     Title   : bin2parents
+     Usage   : my @parents = BGZFast::hts_utility::bin2parents($bin);
+     Function: Identify all parents of a bin
+     Returns : List of bin numbers of parents
+     Args    : Bin number
+
+  bin2children
+     Title   : bin2children
+     Usage   : my @children = BGZFast::hts_utility::bin2children($bin);
+     Function: Identify all children of a bin
+     Returns : List of bin numbers of children
+     Args    : Bin number
+
+  feature_stat
+     Title   : feature_stat
+     Usage   : my ($length, $chr, $pos, $end, $next_chr, $next_pos) =
+                 BGZFast::hts_utility::feature_stat($string, $offset, 'VCF');
+
+               my @stat = BGZFast::hts_utility::feature_stat($string,
+                                                             $offset,
+                                                             'GENERIC',
+                                                             [1, 4, 5]);
+     Function: Get basic attributes of a feature line
+     Returns : Feature length, ref_name, beg, end, next_name, next_pos
+     Args    : String, offset, index_type, [index columns in array ref]
+
+     File Format   index_type INT   index_type TEXT
+     -----------   --------------   ---------------
+     Sam format    1                'SAM'
+     Vcf format    2                'VCF'
+     Generic       0                'GENERIC'
+     Zero-based    65536            'ZERO'
+
+    For multipart features or features with breakpoints, the position of the
+    next feature/breakpoint are given in next_name and next_pos values. All
+    positions returned are zero based. The index_type value can either be a
+    text or an integer value. An index column array reference is only
+    required for generic and zero-based file types (see Tabix documentation
+    for more info).
+

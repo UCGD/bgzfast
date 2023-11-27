@@ -1,0 +1,15 @@
+##PACKAGE
+$data = {
+    'htslib'     => {'Linux_x86_64'  => 'https://github.com/samtools/htslib/releases/download/1.15/htslib-1.15.tar.bz2',
+                     'Linux_i386'    => 'https://github.com/samtools/htslib/releases/download/1.15/htslib-1.15.tar.bz2',
+                     'Darwin_i386'   => 'https://github.com/samtools/htslib/releases/download/1.15/htslib-1.15.tar.bz2',
+                     'Darwin_x86_64' => 'https://github.com/samtools/htslib/releases/download/1.15/htslib-1.15.tar.bz2',
+                     'src_'          => 'https://github.com/samtools/htslib/releases/download/1.15/htslib-1.15.tar.bz2',
+                    },
+    'locations'  => {'Linux_x86_64'  => 'http://topaz.genetics.utah.edu/bgzfast_downloads/static/locations',
+                     'Linux_i386'    => 'http://topaz.genetics.utah.edu/bgzfast_downloads/static/locations',
+                     'Darwin_i386'   => 'http://topaz.genetics.utah.edu/bgzfast_downloads/static/locations',
+                     'Darwin_x86_64' => 'http://topaz.genetics.utah.edu/bgzfast_downloads/static/locations',
+                     'src_'          => 'http://topaz.genetics.utah.edu/bgzfast_downloads/static/locations',
+                    },
+};

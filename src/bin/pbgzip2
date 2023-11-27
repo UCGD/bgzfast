@@ -1,0 +1,457 @@
+#!/usr/bin/perl
+
+BEGIN {
+    if(`uname -a` =~ /el6/){
+	eval "use lib qw(/scratch/ucgd/lustre/ugpuser/apps/el6/local-lib/5.10.1/lib/perl5)";
+    }
+    else{
+	eval "use lib qw(/scratch/ucgd/lustre/ugpuser/apps/el7/local-lib/5.16.3/lib/perl5)";
+    }
+}
+
+use forks;
+use forks::shared;
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX qw(ceil :sys_wait_h);
+use Fcntl qw(:seek :DEFAULT);
+use File::Copy;
+use Cwd qw(abs_path);
+use Compress::Zlib;
+use IPC::Shareable qw(:lock);
+
+BEGIN {
+    binmode(STDIN);
+    binmode(STDOUT);
+    select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+    select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+    
+    $SIG{INT} = sub {exit(130)};
+    
+    mkdir("$ENV{HOME}/.Inline") if(! -d "$ENV{HOME}/.Inline");
+}
+
+our $VERSION = 0.01;
+my ($exe) = $0 =~ /([^\/]+)$/;
+my $usage = "
+Version $VERSION
+
+Usage:  $exe [options] <file>
+
+   This is a parallel implementation of bgzip. This implementation is non-destructive to
+   original files (unlike bgzip and gzip). So you will need to be aware of your own cleanup.
+   When this script runs, it stores intermediate files with a '~' extension (i.e. file.gz~).
+   The intermediate files have predeclared file sizes to take advantage of parallel IO. The
+   '~' extension gets removed from the intermediate file upon completion.
+
+Options:
+
+   -p, --processors  INT    CPUs to use for conversion
+   -?, --help               give this help message
+
+";
+
+#declare options
+my $d_mode;
+my $cpus = 1;
+my $level = 4;
+
+#get options from command line
+my @argv = @ARGV; #backup
+GetOptions("processors|p=i" => \$cpus,
+           "help|?"         => sub{print $usage; exit(0)});
+
+#print usage
+if(!@ARGV){
+    if(!-t){
+	push(@ARGV, '/dev/stdin');
+    }
+    else{
+	print $usage;
+	exit(0);
+    }
+}
+
+##create related file sets
+my $infile = shift @ARGV;
+my $outfile = "$infile.gz";
+if($d_mode){
+    ($outfile = $infile) =~ s/\.gz$//;
+}
+
+##die if outfile already exists
+die "ERROR: Output file already exists: $outfile\n" if(-f $outfile);
+
+#make sections of right size
+my $abs_infile = abs_path($infile);
+my $isize = (stat($abs_infile))[7];
+my ($du) = split(/\s+/, `du -B 1 $abs_infile`); #temp
+die "ERROR: File has null padding corruption\n" if($isize > $du); #temp
+tie(my $osize, 'IPC::Shareable', undef, { size => 64, destroy => 1 });
+$osize = ceil($isize); #estimation
+my $count = ceil($isize/2**27) || 1; #128Mb sections
+my $window = ceil($isize/$count);
+my @sections = (1..$count);
+share(@sections); #share is non destructive for forks::shared
+
+#shared memory values to track output file
+tie(my @ipc_share, 'IPC::Shareable', undef, { size => 2*$count*64, destroy => 1 });
+$ipc_share[0] = 0; #offset for section
+
+#preallocate output file
+my $tmpfile = "$outfile~";
+sysopen(my $OUT, $tmpfile, O_RDWR|O_CREAT|O_TRUNC) or die "ERROR: Could not open output file $outfile: $!";
+truncate($OUT, $osize);
+close($OUT);
+
+#run all threads on data
+my %param = (ISIZE => $isize,
+	     OSIZE => \$osize,
+	     WINDOW => $window,
+	     SECTIONS => \@sections,
+	     IPC_SHARE => \@ipc_share,
+	     CPUS => $cpus,
+	     INFILE => $infile,
+	     OUTFILE => $tmpfile);
+my @threads;
+for(my $i = 1; $i < $cpus && $i < $count; $i++){
+    my $thr = threads->new({'context' => 'scalar'}, \&thread_zip, \%param);
+    push(@threads, $thr);
+}
+thread_zip(\%param); #let main process join in
+
+#wait on threads and collect pieces of index
+foreach my $thr (@threads){
+    $thr->join;
+}
+
+#trim file and add eof block
+sysopen($OUT, $tmpfile, O_RDWR|O_BINARY) or die "ERROR: Could not open output file $outfile: $!";
+sysseek($OUT, $ipc_share[-1], SEEK_SET); #end of file
+print STDERR "Writing EOF block\n";
+my $stat = syswrite($OUT, eof_block());
+die "ERROR: Failed to write EOF block\n" if($stat != 28);
+$osize = $ipc_share[-1]+$stat;
+print STDERR "Closing file\n";
+close($OUT);
+print STDERR "Truncating file\n";
+truncate($tmpfile, $osize); #truncate file not handle (much faster)
+
+#null padding validation
+sysopen(my $IN, $tmpfile, O_RDONLY|O_BINARY) or die "ERROR: Could not open file $tmpfile: $!";
+my $hole = sysseek($IN, 0, 4); #4 is SEEK_HOLE
+die "ERROR: File has IO related corruption: $tmpfile\n" if(defined($hole) && $osize != $hole);
+
+#check EOF
+my $data;
+my $pos = sysseek($IN, -28, SEEK_END); #last 28 bytes
+die "ERROR: File size does not match expected\n" if($pos != $osize-28);
+$stat = sysread($IN, $data, 28, 0);
+die "ERROR: The file is missing the BGZF EOF marker. IO write failed silently.\n" if($stat != 28 || $data ne eof_block());
+close($IN);
+
+#move file to final location
+print STDERR "Moving file\n";
+File::Copy::move($tmpfile, $outfile) or die "ERROR: Could not move output file: $!\n";
+
+use Dumpvalue; #temp
+my $dumper = Dumpvalue->new; #temp
+$dumper->dumpValue(\@ipc_share); #temp
+
+#terminate
+exit(0);
+    
+#------------------------------------------------------------------------------
+#-------------------------------- SUBROUTINES ---------------------------------
+#------------------------------------------------------------------------------
+
+#convenience method to see if I am in a thread or not
+{my $tid; BEGIN{$tid = threads->tid if exists $INC{'threads.pm'}};
+sub is_thread {
+    my $is_thread = 1 if(defined($tid) && $tid != threads->tid);
+    return $is_thread;
+}}
+
+#main fastq conversion done here by each process
+sub thread_zip {
+    my $param = shift;
+
+    #fix thread signalling
+    if(is_thread){
+	binmode(STDIN);
+	binmode(STDOUT);
+	select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+	select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+
+	$SIG{'__DIE__'} = sub {print STDERR  "$_[0]\n"; exit(255)};
+	$SIG{INT} = sub {exit(130)};
+    }
+
+    #load parameters
+    my $isize = $param->{ISIZE};
+    my $osize = $param->{OSIZE};
+    my $window = $param->{WINDOW};
+    my $infile = $param->{INFILE};
+    my $outfile = $param->{OUTFILE};
+    my $sections = $param->{SECTIONS};
+    my $ipc_share = $param->{IPC_SHARE};
+    my $validate = 1;
+
+    #open input file
+    sysopen(my $IN, $infile, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $infile: $!";
+
+    #open output file
+    sysopen(my $OUT, $outfile, O_RDWR|O_BINARY) or die "ERROR: Could not open output file $outfile: $!";
+
+    #==read sections
+    my %buffer;
+    my $osz = $$osize; #copy
+    while(my $section = shift @$sections){
+	print STDERR threads->tid." compressing $section\n"; #temp
+	my $start = ($section-1) * $window;
+	my $end   = $section * $window;
+	$end = scalar($isize) if($end > $isize); #don't go past end
+
+	#move to position in input and output file for section
+	sysseek($IN, $start, SEEK_SET);
+
+	#inflate all blocks in section
+	print STDERR threads->tid." reading $section\n"; #temp
+	my $data = '';
+	my $needed = $end-$start;
+	while($needed){
+	    my $stat = sysread($IN, $data, $end-$start, length($data)); #grabs compression block and footer
+	    next if(!defined($stat));
+	    last if($stat == 0);
+	    $needed -= $stat;
+	}
+
+	#deflate into buffer
+	print STDERR threads->tid." deflating $section\n"; #temp
+	$buffer{$section} = '';
+	deflate(\ (substr($data, 0, 65280, '')), \ ($buffer{$section})) while(length($data));
+	my $bsize = length($buffer{$section});
+
+	#print any buffered sections
+	print STDERR threads->tid." copying shared memory\n"; #temp
+	(tied @$ipc_share)->shlock;
+	$ipc_share->[2*$section-1] = $bsize;
+	my @copy = @$ipc_share; #work with copy to avoid multiple calls to Storable
+	(tied @$ipc_share)->shunlock;
+	print STDERR threads->tid." fill in missing offsets\n"; #temp
+	for(my $i = 1; $i < @copy; $i += 2){ #fill in missing offsets
+	    print STDERR threads->tid." waiting on ".(($i+1)/2)."\n" if(!defined($copy[$i])); #temp
+	    last if(!defined($copy[$i]));
+	    if(!defined($copy[$i+1])){
+		my $eoff = $copy[$i-1] + $copy[$i];
+		$copy[$i+1] = $eoff;
+		#next unless(defined($buffer{$i}));
+
+		(tied @$ipc_share)->shlock;
+		$ipc_share->[$i+1] = $eoff;
+		(tied @$ipc_share)->shunlock;
+	    }
+	}
+	foreach my $key (sort {$a <=> $b} keys %buffer){ #print buffer
+	    last unless(defined($copy[2*$key-2])); #needed for ordered offset
+	    print STDERR threads->tid." printing buffer $key\n"; #temp
+
+	    #extend file if needed
+	    my $soff  = $copy[2*$key-2];
+	    my $bsize = $copy[2*$key-1];
+	    my $eoff  = $copy[2*$key];
+	    if($soff+$bsize > $osz){
+		$osz += 10*$bsize; #grow
+		$osz = $soff+10*$bsize if($soff+10*$bsize > $osz);
+
+		#change
+		(tied $$osize)->shlock;
+		if($$osize < $osz){
+		    $$osize = $osz;
+		    truncate($OUT, $osz);
+		}
+		(tied $$osize)->shunlock;
+	    }
+
+	    #write data
+	    sysseek($OUT, $soff, SEEK_SET);
+	    my $needed = $bsize;
+	    while($needed){
+		my $stat = syswrite($OUT, $buffer{$key}, $needed, $bsize-$needed);
+		next if(!defined($stat));
+		$needed -= $stat;
+	    }
+	    delete($buffer{$key});
+	}
+    }
+    close($IN);
+
+    #==handle remaining buffered sections
+    my $ok = 0;
+    (tied @$ipc_share)->shlock;
+    my @copy = @$ipc_share; #work with copy to avoid multiple calls to Storable
+    (tied @$ipc_share)->shunlock;
+    for(my $i = 2*$ok+1; $i < @copy; $i += 2){ #fill in missing offsets
+	last if(!defined($copy[$i]));
+	$ok = ($i+1)/2; #last key with needed info
+	if(!defined($copy[$i+1])){
+	    my $eoff = $copy[$i-1] + $copy[$i];
+	    $copy[$i+1] = $eoff;
+	    #next unless(defined($buffer{$i}));
+
+	    (tied @$ipc_share)->shlock;
+	    $ipc_share->[$i+1] = $eoff;
+	    (tied @$ipc_share)->shunlock;
+	}
+    }
+    foreach my $key (sort {$a <=> $b} keys %buffer){ #print buffered section
+	while($key > $ok){ #wait and fill in offsets if necessary
+	    (tied @$ipc_share)->shlock;
+	    @copy = @$ipc_share;
+	    (tied @$ipc_share)->shunlock;
+	    if(!defined($copy[2*$ok+1])){
+		sleep 1;
+		next;
+	    }
+
+	    for(my $i = 2*$ok+1; $i < @copy; $i += 2){ #fill in missing offsets
+		last if(!defined($copy[$i]));
+		$ok = ($i+1)/2;    #last key with needed info
+		if(!defined($copy[$i+1])){
+		    my $eoff = $copy[$i-1] + $copy[$i];
+		    $copy[$i+1] = $eoff;
+		    #next unless(defined($buffer{$i}));
+
+		    (tied @$ipc_share)->shlock;
+		    $ipc_share->[$i+1] = $eoff;
+		    (tied @$ipc_share)->shunlock;
+		}
+	    }
+	}
+	
+	#set ordered offset and write data
+	my $soff  = $copy[2*$key-2];
+	my $bsize = $copy[2*$key-1];
+	sysseek($OUT, $soff, SEEK_SET);
+	my $needed = $bsize;
+	while($needed){
+	    my $stat = syswrite($OUT, $buffer{$key}, $needed, $bsize-$needed);
+	    next if(!defined($stat));
+	    $needed -= $stat;
+	}
+	delete($buffer{$key});
+    }
+    close($OUT);
+    
+    return;
+}
+
+sub seek_next_block {
+    my $FH = shift; #filehandle
+    my $start = shift; #where to start looking from
+    my $wence = shift || SEEK_SET; #(SEEK_SET, SEEK_CUR, SEEK_END)
+
+    #not enough space left for a block
+    my $size = (stat($FH))[7]; #file size
+    return sysseek($FH, $size, SEEK_SET) if($size-$start < 28);
+
+    #go to starting search position
+    my $pos = sysseek($FH, $start, $wence);
+
+    #read in some data to check
+    my $data;
+    sysread($FH, $data, 65536, 0); #max block
+
+    #scan string for block header
+    my $offset = find_block_offset(\$data, 0);
+    return sysseek($FH, $size, SEEK_SET) if($offset == -1);
+
+    #adjust file position with new offset and return
+    $pos += $offset;
+    return sysseek($FH, $pos, SEEK_SET);
+}
+
+sub find_block_offset {
+    my $ref = shift;
+    my $offset = shift || 0;
+
+    #find block keys in data
+    my $key1 = pack('H8', '1f8b0804'); #4 byte static header key
+    my $key2 = pack('H12', '060042430200'); #key1, 6 non-static bytes, then key2 (6 bytes)
+    while(1){
+        #match first static key
+        $offset = index($$ref, $key1, $offset);
+        return -1 if($offset == -1);
+
+        #match second static key
+        my $offset2 = index($$ref, $key2, $offset);
+        return -1 if($offset2 == -1);
+
+        #second match must be 10 bytes from first offset (4 byte key1 and 6 byte gap)
+        if($offset2-$offset == 10){
+            last;
+        }
+        else{
+            $offset += 4; #jump over key1 match and try again
+        }
+    }
+
+    return $offset;
+}
+
+sub inflate {
+    my $buffer = shift; #reference
+    my $ref    = shift; #reference
+    my $validate = shift;
+
+    return if(!$buffer);
+
+    my ($i_obj, $stat) = inflateInit(-WindowBits => -15, -Bufsize => 131072);
+    die "ERROR: Failed to create zlib inflation object with status: $stat\n" if($stat);
+
+    substr($$buffer, 0, 18, '');
+    $$ref .= scalar($i_obj->inflate($buffer));
+
+    #validate the length and crc32
+    if($validate){
+        my ($crc32, $isize);
+        if(ref($ref)){
+            ($crc32, $isize) = unpack('L<L<', $$buffer);
+	}
+        else{
+            ($crc32, $isize) = unpack('L<L<', $buffer);
+        }
+	
+        if($isize != $i_obj->total_out()){ #size does not match
+            die "ERROR: The expected ISIZE of the uncompressed block does not match\n";
+        }
+	if($crc32 != crc32(substr($$ref, -$isize, $isize))){ #crc32 does not match
+            die "ERROR: The expected CRC32 of the uncompressed block does not match\n";
+        }
+    }
+
+    return;
+}
+
+sub deflate {
+    my $buffer = shift; #reference
+    my $ref = shift; #reference
+
+    my ($d_obj, $stat) = deflateInit(-WindowBits => -15, -Bufsize => 131072, -Level => 4);
+    die "ERROR: Failed to create zlib deflation object with status: $stat\n" if($stat);
+
+    my $offset = length($$ref);
+    $$ref .= pack('H36', '1f8b08040000000000ff0600424302000000'); #header (BSIZE=0)
+    $$ref .= scalar($d_obj->deflate($buffer)).scalar($d_obj->flush); #compressed data
+    $$ref .= pack('V', crc32($buffer)); #CRC32
+    $$ref .= pack('V', $d_obj->total_in()); #ISIZE
+    substr($$ref, $offset+16, 2, pack('v', $d_obj->total_out+6+19)); #set final BSIZE
+
+    return;
+}
+
+sub eof_block {
+    return pack('H56', '1f8b08040000000000ff0600424302001b0003000000000000000000');
+}

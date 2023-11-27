@@ -1,0 +1,202 @@
+NAME
+    BGZFast::bgzf_utility - Convenient functions BGZF file manipulation
+
+SYNOPSIS
+      use BGZFast::bgzf_utility;
+
+      # Find first block in a string
+      my $offset = BGZFast::bgzf_utility::find_block_offset($str, 0);
+
+      # Find last block in a string
+      $offset = BGZFast::bgzf_utility::rfind_block_offset($str, length($string));
+
+      #find full blocks
+      my ($off, $len) = BGZFast::bgzf_utility::find_full_block($str, 0); #first
+      ($off, $len) = BGZFast::bgzf_utility::rfind_full_block($str, length($string)); #last
+
+      # Get info for a block
+      my ($blen, $ilen, $crc32) = BGZFast::bgzf_utility::block_stat($offset);
+
+      # Compress/Decompress a string
+      my $unzipped = BGZFast::bgzf_utility::unzip($str);
+      my $zipped = BGZFast::bgzf_utility::zip($unzipped);
+
+DESCRIPTION
+    BGZFast::bgzf_utility provides convenient functions for basic
+    manipulation of BGZF file structure and content.
+
+BASICS OF BGZF HEADER/FOOTER UNPACKING AND VALIDATION
+    BGZFast::bgzf_utility manipulates and validates BGZF blocks using
+    specific assumptions based on the format specification. The basic logic
+    of these assumptions is simple but may be unclear when reading the
+    source code directly. The following non-optimized pseudo-code
+    demostrates the same basic logic in a less obfuscated and hopfully easy
+    to understand way.
+
+      # In BGZF format data is compressed into a series of indepenent blocks.
+      # The header for each block is 18 bytes long and can be unpacked like so
+      my $header = substr($block, 0, 18); #first 18 bytes of block
+      my ($id1,$id2,$cm,$flg, $mtime,$xfl,$os,
+          $xlen, $si1,$si2,$slen,$bsize) = unpack('CCCCVCCvCCvv', $header);
+
+      # Most values in block header are static and can be validated like so
+      die "ERROR: Does not appear to be a BGZF file\n"
+         if($id1 != 31 || $id2 != 139 || $cm != 8 || $flg != 4 ||
+            $xlen != 6 || $si1 != 66 || $si2 != 67 || $slen != 2);
+
+      # The value of $bsize cannot be larger than 65536 bytes or 64kb
+      die "ERROR: Bsize is outside of expected range\n" if($bsize > 65536);
+
+      # Note $bsize reported in the header is always 1 shorter than true value
+      my $true_size = $bsize + 1;
+      die "ERROR: Calculated block size does not match observed size\n"
+         if($true_size != length($block));
+ 
+      # Calculate the size of the compressed data section following the header
+      my $cdata_size = $bsize - $xlen - 19; #Note $xlen is always 6
+      my $cdata = substr($block, 18, $cdata_size); #offset of 18 to skip header
+ 
+      # Block footer is 8 bytes long and can be unopacked like so
+      my $footer = substr($block, 18 + $cdata_size, 8); #follows compressed section
+      my ($crc32, $isize) = unpack('L<L<', $footer);
+
+      # The isize or inflated data size should be smaller than bsize to
+      # ensure that if it grows with compression (can happen), then it does
+      # not force bsize to exceed its maximum. Samtools does this by setting
+      # isize to a maximum of 65536 minus 256 or 65280.
+      die "ERROR: Isize is outside of expected range\n" if($isize > 65280);
+
+      # The isize value and crc32 value can be validated after decompression
+      my $data = Compress::Zlib::uncompress($cdata);
+      die "ERROR: Inflated data does not match expected size\n"
+         if(length($data) != $isize);
+      die "ERROR: Inflated data CRC32 not match expected value\n"
+         if(Compress::Zlib::crc32($data) != $crc32);
+
+SEE ALSO
+    BGZFast::bgzf_manipulator
+
+AUTHOR
+    Carson Holt <carson.holt@genetics.utah.edu>.
+
+    Copyright (c) 2017 University of Utah.
+
+    This library is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself. See DISCLAIMER.txt for disclaimers
+    of warranty.
+
+APPENDIX
+    The rest of the documentation details each of the object methods.
+    Internal methods are usually preceded with a _
+
+
+    For simple access, the following methods are provided:
+
+  validate_block_header
+     Title   : validate_block_header
+     Usage   : BGZFast::bgzf_utility::validate_block_header($string);
+     Function: Validate the BGZF header in the given string
+     Returns : True on success, 0 on failure, and undef if string too short
+     Args    : String or string reference
+               Optional offset in string
+
+  block_stat
+     Title   : block_stat
+     Usage   : BGZFast::bgzf_utility::block_stat($string);
+     Function: Get information about a BGZF block from its header and footer 
+     Returns : Block length, inflated data length, and CRC32 of inflated data
+               (will return undef on partial block).
+     Args    : String or string reference
+               Optional offset in string
+
+  find_block_offset
+     Title   : find_block_offset
+     Usage   : BGZFast::bgzf_utility::find_block_offset($string);
+     Function: Scan for start of BGZF block in string
+     Returns : Offset immediately before block start (-1 if not found)
+     Args    : String or string reference
+               Optional offset in string
+
+  find_full_block
+     Title   : find_full_block
+     Usage   : BGZFast::bgzf_utility::find_full_block($string);
+     Function: Scan for the first full BGZF block in a string
+     Returns : Offset of block start and block length (returns -1 if not found)
+     Args    : String or string reference
+               Optional offset in string
+
+  rfind_block_offset
+     Title   : rfind_block_offset
+     Usage   : BGZFast::bgzf_utility::rfind_block_offset($string);
+     Function: Scan backwards for start of BGZF block in string
+     Returns : Offset immediately before block start (-1 if not found)
+     Args    : String or string reference
+               Optional offset in string
+
+  rfind_full_block
+     Title   : rfind_full_block
+     Usage   : BGZFast::bgzf_utility::rfind_full_block($string);
+     Function: Scan backwards for the first full BGZF block in a string
+     Returns : Offset of block start and block length (returns -1 if not found)
+     Args    : String or string reference
+               Optional offset in string
+
+  zip
+     Title   : zip
+     Usage   : $zipped = BGZFast::bgzf_utility::zip($string);
+               BGZFast::bgzf_utility::zip($string, $zipped, 6);
+     Function: Deflate a string to BGZF format
+     Returns : String of deflated data
+     Args    : String or string reference of data to deflate
+               Optional string/ref to deflate to (returns new otherwise)
+               Optional desired compression level (defaults to 4)
+
+     Note that this method is destuctive to input string but concatenates to
+     the output string.
+
+  unzip
+     Title   : unzip, unzip_partial, unzip_full
+     Usage   : $string = BGZFast::bgzf_utility::unzip($zipped);
+               BGZFast::bgzf_utility::unzip($zipped, $string, 1); #partial fail
+               BGZFast::bgzf_utility::unzip_partial($zipped, $string);
+               BGZFast::bgzf_utility::unzip_full($zipped, $string); #partial fail
+     Function: Deflate a string to BGZF format
+     Returns : String of deflated data
+     Args    : String or string reference of data to deflate
+               Optional string/ref to deflate to (returns new otherwise)
+               Optional flag to induce failure on partial blocks (default false)
+        
+     Note that this method is destuctive to input string but concatenates to
+     the output string. Will leave trailing partial blocks in input string if
+     failure flag not set.
+
+  sparse_check
+     Title   : sparse_check
+     Usage   : BGZFast::bgzf_utility::sparse_check($file) or die "corrupt file";
+     Function: Checks for sparse file holes which will be null padded. 
+     Returns : 1 if a hole is found and 0 otherwise
+     Args    : File path
+
+  eof_block
+     Title   : eof_block
+     Usage   : $eof = BGZFast::bgzf_utility::eof_block();
+     Function: Get a standard BGZF EOF block
+     Returns : String of EOF block
+     Args    : None
+
+  max_bsize
+     Title   : max_bsize
+     Usage   : $eof = BGZFast::bgzf_utility::max_bsize();
+     Function: Get the maximum block size as defined for BGZF format
+     Returns : 65536 (== 2**16 == 64kb)
+     Args    : None
+
+  max_isize
+     Title   : max_isize
+     Usage   : $eof = BGZFast::bgzf_utility::max_isize();
+     Function: Get the maximum size of data to compress for a single block
+               Must be smaller than MAX_BSIZE because it is possible for
+               blocks to grow with compression (samtools uses MAX_BSIZE-256)
+     Returns : 65280 (MAX_BSIZE - 256)
+     Args    : None
+

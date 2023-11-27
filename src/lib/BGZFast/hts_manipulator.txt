@@ -1,0 +1,94 @@
+NAME
+    BGZFast::hts_manipulator - Manipulation of sequence realated file
+    structure
+
+SYNOPSIS
+      use BGZFast::hts_manipulator;
+
+      # Jump to start of first feature after given file position
+      my $obj = BGZFast::hts_manipulator->new('/path/to/file.gff.gz');
+      my ($real, $virtual) = $obj->smart_seek(10_000_000); #pos is real file
+
+      # Get position from index file
+      ($real, $virtual) = $obj->query_index($chr, $pos);
+      $obj->block_seek($real, $virtual); #move to position
+
+      #read features one after the other to perform analysis
+      while(my $f = $obj->next_feature){
+        my ($real, $virtual) = $f->offsets();
+      }
+
+DESCRIPTION
+    BGZFast::hts_manipulator provides a mechanism to easilly navegate and
+    manipulate high throughput sequence related file formats that have been
+    indexed. This allows these BGZF compressed files to be shattered and
+    partitioned for parallel processing and streaming.
+
+INDEXING
+    Indexing can be performed using the $obj->make_index method
+
+SEE ALSO
+    BGZFast::hts_utility BGZFast::bgzf_manipulator
+
+AUTHOR
+    Carson Holt <carson.holt@genetics.utah.edu>.
+
+    Copyright (c) 2017 University of Utah.
+
+    This library is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself. See DISCLAIMER.txt for disclaimers
+    of warranty.
+
+APPENDIX
+    The rest of the documentation details each of the object methods.
+    Internal methods are usually preceded with a _
+
+
+    For simple access, the following methods are provided:
+
+  new
+     Title   : new
+     Usage   : my $obj = BGZFast::hts_manipulator->new($path, %options);
+     Function: Initialize a new file manipulator object.
+     Returns : A new BGZFast::hts_manipulator object.
+     Args    : A single BGZF file (or regular file if setting -is_bgzf => 0)
+               Optional arguments:
+
+     Option        Description                                         Default
+     -----------   -----------                                         -------
+     -is_bgzf      Indicates whether a file is in BGZF format          1
+     -cpus         How many CPUs to use on paralelizable operations    1
+     -idx_type     Predefined index type (SAM, VCF, GENERIC, ZERO)     GENERIC
+     -idx_col      Seq, start, and end columns to use for indexing     [1,4,5]
+     -idx_meta     Meta data character to use when parsing file        #
+     -idx_skip     Count of lines to always skip for header            0
+
+  header
+     Title   : header
+     Usage   : my $header = $obj->header();
+     Function: Get header from file.
+     Returns : A BGZFast::header object.
+     Args    : None
+
+  feature_stat
+     Title   : feature_stat
+     Usage   : ($length,
+                $refid,
+                $pos,
+                $end,
+                $next_refid,
+                $next_pos) = $obj->feature_stat(\$string);
+     Function: Get basic feature info from string
+     Returns : Feature length, ref ID, beginning pos, end pos, next ref ID for
+               split features, next pos
+               (returns undef for partial features)
+     Args    : String or string reference
+               Optional offset in string
+
+  next_feature
+     Title   : next_feature
+     Usage   : $f = $obj->next_feature();
+     Function: Get next feature from buffer
+     Returns : Feature object (undef if end of file)
+     Args    : None
+

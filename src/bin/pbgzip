@@ -1,0 +1,1115 @@
+#!/usr/bin/perl
+
+use forks;
+use forks::shared;
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX qw(ceil :sys_wait_h);
+use Fcntl qw(:seek :DEFAULT);
+use File::Copy;
+use Cwd qw(abs_path);
+use Compress::Zlib;
+use IPC::Shareable qw(:lock);
+
+BEGIN {
+    binmode(STDIN);
+    binmode(STDOUT);
+    select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+    select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+    
+    $SIG{INT} = sub {exit(130)};
+    
+    mkdir("$ENV{HOME}/.Inline") if(! -d "$ENV{HOME}/.Inline");
+}
+
+our $VERSION = 0.01;
+my ($exe) = $0 =~ /([^\/]+)$/;
+my $usage = "
+Version $VERSION
+
+Usage:  $exe [options] <file>
+
+   This is a parallel implementation of bgzip. This implementation is non-destructive to
+   original files (unlike bgzip and gzip). So you will need to be aware of your own cleanup.
+   When this script runs, it stores intermediate files with a '~' extension (i.e. file.gz~).
+   The intermediate files have predeclared file sizes to take advantage of parallel IO. The
+   '~' extension gets removed from the intermediate file upon completion.
+
+Options:
+
+   -d, --decompress         decompress
+   -o, --out         FILE   specify output file
+   -c, --stdout             write to STDOUT
+   -f, --force              force overwrite of output file
+   -p, --processors  INT    CPUs to use for conversion
+   -l, --level       INT    compression level (1..9)
+   -b, --offset      INT    decompress at virtual file pointer (0-based uncompressed offset)
+   -s, --size        INT    decompress INT bytes (uncompressed size)
+   -i, --index              compress and create BGZF index
+   -r, --reindex            (re)index existing compressed file
+   -I, --index-name  FILE   name of BGZF index file [file.gz.gzi]
+   -?, --help               give this help message
+
+";
+
+#declare options
+my $c_mode; #compress mode
+my $d_mode; #decompress mode
+my $r_mode; #reindex mode
+my $dout;
+my $dgzi;
+my $dstdin;
+my $dstdout;
+my $dfdin;
+my $dfdout;
+my $cpus = 1;
+my $level = 4;
+my $doff;
+my $dsize;
+my $doindex;
+my $force;
+
+#get options from command line
+my @argv = @ARGV; #backup
+GetOptions("decompress|d"   => \$d_mode,
+	   "processors|p=i" => \$cpus,
+	   "stdout|c"       => \$dstdout,
+	   "force|f"        => \$force,
+	   "out|o=s"        => \$dout,
+	   "level|l=i"      => \$level,
+	   "offset|b=i"     => \$doff,
+	   "size|s=i"       => \$dsize,
+	   "index|i"        => \$doindex,
+	   "reindex|r"      => \$r_mode,
+	   "index-name|I=s" => \$dgzi,
+	   "force|f"        => \$force,
+           "help|?"         => sub{print $usage; exit(0)});
+
+#print usage
+if(!@ARGV){
+    if(!-t){
+	push(@ARGV, '/dev/stdin');
+    }
+    else{
+	print $usage;
+	die "ERROR: No input file specified\n";
+	exit(0);
+    }
+}
+
+#correct options
+$c_mode = (!$d_mode && !$r_mode) ? 1 : 0;
+$doindex = 1 if(($c_mode && $dgzi) || $r_mode);
+$dstdout = 1 if($dout && abs_path($dout) eq abs_path('/dev/stdout'));
+$dstdin = 1 if( grep {abs_path($_) eq abs_path('/dev/stdin')} @ARGV);
+$dout = '/dev/stdout' if(!$dout && $dstdin);
+$dout = '/dev/stdout' if(!$dout && $dstdout);
+$dfdout = 1 if(-c $dout);
+$dfdin = 1 if(grep {-c $_} @ARGV);
+
+#validate parameters
+die "ERROR: The -c/stdout and -o/out options are mutually exclusive. Specify only one.\n"
+    if($dstdout && $dout && abs_path($dout) ne abs_path('/dev/stdout'));
+my @bad = grep {! -f $_} @ARGV;
+die join('', map {"ERROR: File does not exist: $_\n"} @bad) if(@bad);
+
+if($c_mode){
+    die "ERROR: -b/offset and -s/size can only be specified when decompressing a file\n"
+	if(defined($doff) || defined($dsize));
+    @bad = grep {/\.gz$/} @ARGV;
+    die join('', map {"ERROR: Input file already has *.gz extension: $_\n"} @bad) if(@bad);
+    die "ERROR: You can not generate indexes when compressing to STDOUT and FDs\n"
+	if($dfdout && $doindex);
+}
+elsif($d_mode){
+    die "ERROR: You cannot specify -d/decompress together with -i/index or -r/reindex\n"
+	if($r_mode || $doindex);
+    die "ERROR: Specified GZI index file does not exist: $dgzi\n"
+	if($dgzi && !-f $dgzi);
+    @bad = (grep {!/\.gz$/} @ARGV) if(!$dout);
+    die join('', map {"ERROR: Unknown suffix. *.gz expected: $_\n"} @bad) if(@bad);
+
+    if(defined($doff) || defined($dsize)){
+	die "ERROR: the -b/offset and -s/size options cannot be used for STDIN/FD input\n"
+	    if($dsfdin);
+	die "ERROR: The -b/offset option must be specified when -s/size is supplied\n"
+	    if(defined($dsize) && !defined($doff));
+	die "ERROR: The -s/size option must be specified when -b/offset is supplied\n"
+	    if(defined($doff) && !defined($dsize));
+    }
+}
+elsif($r_mode){
+    die "ERROR: -b/offset and -s/size can only be specified when decompressing a file\n"
+	if(defined($doff) || defined($dsize));
+    die "ERROR: The -o/out and -c/stdout options are not valid when reindexing\n"
+	if($dout || $dstdout);
+    die "ERROR: Indexing of STDIN and FDs is not supported"
+	if($dfdin);
+}
+
+if(@ARGV > 1){
+    #die "ERROR: The -o/out option cannot be used with a multiple input file list\n"
+    #	if($dout);
+    die "ERROR: The -I/index-name option cannot be used with a multiple input file list\n"
+	if($dgzi);
+    die "ERROR: The -s/size and -b/offset options cannot be used with a multiple input file list\n"
+	if(defined($doff) || defined($dsize));
+    die "ERROR: You cannot use pipes, STDIN, or FDs with multiple input file list\n"
+	if($dfdin);
+}
+
+#validate infile format for parameters
+if($d_mode){
+    @bad = grep {!is_gzf($_)} grep {!-c $_} @infiles;
+    die join('', map {"ERROR: Unknown file format: $_\n"} @bad) if(@bad);
+    if(defined($doff) || defined($dsize)){
+    	@bad = grep {!is_bgzf($_)} @ARGV;
+    	die join('', map {"ERROR: Only BGZF files can be used with the ".
+    			  "-b/offset and -s/size options: $_\n"} @bad) if(@bad);
+    }
+}
+elsif($r_mode){
+    @bad = grep {!is_bgzf($_)} @ARGV;
+    die join('', map {"ERROR: Only BGZF files can be indexed: $_\n"} @bad) if(@bad);
+}
+
+##create related file sets
+my @file_sets;
+my $total = 0;
+while(my $file = shift @ARGV){
+    #get outfile
+    my $inf_file; #inflated file
+    my $def_file; #deflated file
+    my $idx_file; #indexed file
+    if($c_mode){
+	$inf_file = $file;
+	$def_file = ($dout) ? $dout : "$inf_file.gz";
+	$idx_file = ($dgzi) ? $dgzi : "$def_file.gzi";
+    }
+    elsif($d_mode){
+	$def_file = $file;
+	($inf_file = $def_file) =~ s/\.gz$//;
+	$inf_file = $dout if($dout);
+	$idx_file = ($dgzi) ? $dgzi : "$def_file.gzi";
+    }
+    elsif($r_mode){
+	$def_file = $file;
+	($inf_file = $def_file) =~ s/\.gz$//;
+	$idx_file = ($dgzi) ? $dgzi : "$def_file.gzi";
+    }
+
+    #output files already exist. Should I overwrite?
+    if(!$force){
+	if($c_mode && -f $def_file && !-c $def_file){
+	    print STDERR "Output file $def_file already exists; do you wish to overwrite (y or n)? ";
+	    my $response = <STDIN>;
+	    chomp($response);
+	    if(!$response || substr(lc($response), 0, 1) ne 'y'){
+		print STDERR "\tnot overwritten\n";
+		next; #skip
+	    }
+	}
+	elsif($d_mode && -f $inf_file && !-c $inf_file){
+	    print STDERR "Output file $inf_file already exists; do you wish to overwrite (y or n)? ";
+	    my $response = <STDIN>;
+	    chomp($response);
+	    if(!$response || substr(lc($response), 0, 1) ne 'y'){
+		print STDERR "\tnot overwritten\n";
+		next; #skip
+	    }
+	}
+	elsif($r_mode && -f $idx_file){ #note always overwrite when indexing happens together with compression
+	    print STDERR "Index file $idx_file already exists; do you wish to overwrite (y or n)? ";
+	    my $response = <STDIN>;
+	    chomp($response);
+	    if(!$response || substr(lc($response), 0, 1) ne 'y'){
+		print STDERR "\tnot overwritten\n";
+		next; #skip
+	    }
+	}
+    }
+
+    #add files to stack
+    my $size = (stat($file))[7];
+    push(@file_sets, [$inf_file, $def_file, $idx_file, $size]);
+}
+
+
+
+
+
+
+
+=head
+#replace STDIN with file descriptor if necessary
+if($use_stdin && abs_path($ARGV[0]) ne abs_path('/dev/stdin')){
+    close(STDIN);
+    open(STDIN, "<$infile") or die "ERROR: Couldn't open FD as STDIN: $!";
+}
+
+#replace SDTOUT with file descriptor if necessary
+if($use_stdout && $dout && abs_path($dout) ne abs_path('/dev/stdout')){
+    close(STDOUT);
+    open(STDOUT, ">$outfile") or die "ERROR: Couldn't open FD as STDOUT: $!";
+}
+=cut
+
+#handle STDIN as input file
+if(@bgzf == 1 && $use_stdin){
+    if(File::Which('bgzip')){ #just pass it off to standard bgzip
+	run_bgzip(@{shift @bgzf});
+    }
+    else{ #put STDIN data into temporary file and use that instead
+	my ($fh, $filename) = File::Temp::tempfile(DESTROY => 1);
+	syswrite($fh, $bgzf[3]); #write buffer
+	while(read(STDIN, my $data, 33554432)){
+	    syswrite($fh, $data);
+	}
+	close($fh);
+	
+	$bgzf[0] = $filename; #make real files
+	$bgzf[3] = ''; #empty buffer
+	$use_stdin = 0; #no longer really stdin
+    }
+}
+
+###process each BGZF file
+foreach my $infile (@bgzf){
+    ###compress mode
+    if($c_mode){
+	#make sections of right size
+	my $isize = ($use_stdin) ? 1073741824 : (stat($infile))[7];
+	my $osize = ceil($isize/3); #estimation
+	my $count = ceil($isize/1073741824); #100Mb sections
+	my $window = ceil($isize/$count);
+	my @sections = (1..$count);
+	share(@sections); #share is non destructive for forks::shared
+	
+	#shared memory values to track output file
+	tie(my @ipc_share, 'IPC::Shareable', undef, { size => $count*24, destroy => 1 });
+	$ipc_share[0] = 0; #offset for section
+	
+	#preallocate output file
+	my $tmpfile = ($use_stdout) ? $outfile : "$outfile~";
+	if(!$use_stdout){
+	    sysopen(my $OUT, $tmpfile, O_RDWR|O_CREAT|O_TRUNC) or die "ERROR: Could not open output file $outfile: $!";
+	    truncate($OUT, $osize);
+	    close($OUT);
+	}
+	
+	#run all threads on data
+	my %param = (ISIZE => $isize,
+		     OSIZE => $osize,
+		     WINDOW => $window,
+		     SECTIONS => \@sections,
+		     IPC_SHARE => \@ipc_share,
+		     CPUS => $cpus,
+		     INFILE => $infile,
+		     OUTFILE => $tmpfile);
+	my @threads;
+	for(my $i = 1; $i < $cpus && $i < $count; $i++){
+	    my $thr = threads->new({'context' => 'scalar'}, \&thread_zip, \%param);
+	    push(@threads, $thr);
+	}
+	my $indexes = thread_zip(\%param); #let main process join in
+	
+	#wait on threads and collect pieces of index
+	foreach my $thr (@threads){
+	    my $indexes2 = $thr->join;
+	    $indexes->{$_} = $indexes2->{$_} foreach(keys %$indexes2);
+	}
+	
+	#merge index pieces
+	my $index = $indexes->{'1'};
+	foreach my $key (grep {$_ != 1} sort {$a <=> $b} keys %$indexes){
+	    my $index2 = $indexes->{$key};
+	    
+	    #fix index offsets
+	    my $ifix = $index->[-1][2]+$index->[-1][3];
+	    $_->[2] += $ifix foreach(@$index2);
+	    push(@$index, @$index2);
+	}
+	
+	#trim file and add eof block
+	$osize = $ipc_share[-1]+length(eof_block());
+	if($use_stdout){
+	    syswrite(STDOUT, eof_block());
+	}
+	else{
+	    sysopen(my $OUT, $tmpfile, O_RDWR|O_BINARY) or die "ERROR: Could not open output file $outfile: $!";
+	    truncate($OUT, $ipc_share[-1]);
+	    sysseek($OUT, 0, SEEK_END); #end of file
+	    syswrite($OUT, eof_block());
+	    close($OUT);
+	}
+	
+	#move file to final location
+	File::Copy::move($tmpfile, $outfile) or die "ERROR: Could not move output file: $!\n";
+	#unlink($infile) if(-f $outfile && (stat($outfile))[7] == $osize);
+	
+	#write index if specified
+	write_gzi($index, $gzi) if($doindex);
+	
+	#finished
+	next;
+    }
+
+    ###get index
+    my $index;
+    if($r_mode || ! -f $gzi){ #make a new index direct from bgzf file
+	#make sections of right size
+	my $isize = (stat($infile))[7];
+	my $count = ceil($isize/33554432); #32Mb sections
+	my $window = ceil($isize/$count);
+	my @sections = (1..$count);
+	share(@sections); #share is non destructive for forks::shared
+	
+	#run all threads on data
+	my @threads;
+	my %param = (WINDOW => $window, ISIZE => $isize,
+		     SECTIONS => \@sections, INFILE => $infile);
+	for(my $i = 1; $i < $cpus; $i++){
+	    my $thr = threads->new({'context' => 'scalar'}, \&thread_index, \%param);
+	    push(@threads, $thr);
+	}
+	my $indexes = thread_index(\%param);
+	
+	#wait on threads and collect pieces of index
+	foreach my $thr (@threads){
+	    my $indexes2 = $thr->join;
+	    $indexes->{$_} = $indexes2->{$_} foreach(keys %$indexes2);
+	}
+	
+	#merge index pieces
+	my $index = $indexes->{'1'};
+	foreach my $key (grep {$_ != 1} sort {$a <=> $b} keys %$indexes){
+	    my $index2 = $indexes->{$key};
+	    
+	    #fix index offsets
+	    my $ifix = $index->[-1][2]+$index->[-1][3];
+	    $_->[2] += $ifix foreach(@$index2);
+	    push(@$index, @$index2);
+	}
+	
+	##write index and exit if specified
+	if($r_mode){
+	    write_gzi($index, $gzi);
+	    next; #finished
+	}
+    }
+    elsif($gzi){ #parse stored index
+	$index = gzi2index($infile, $gzi);
+    }
+    
+    ###decompress  mode
+    if($d_mode){
+	#identify input and  output sizes
+	my $isize = $index->[-1][0]+$index->[-1][1];
+	my $osize = $index->[-1][2]+$index->[-1][3];
+	if(defined($doff)){
+	    die "ERROR: Inicated virtual offset $doff is beyond decompressed size $osize\n" if($doff >= $osize);
+	    die "ERROR: Inicated virtual size $dsize is beyond decompressed size $osize\n" if($doff+$dsize >= $osize);
+	    $osize = $dsize;
+	    
+	    #filter index to only those within desired regions
+	    @$index = grep {($doff <= $_->[2] && $_->[2] < $doff+$dsize) ||
+				($_->[2] <= $doff && $doff < $_->[2]+$_->[3])} @$index;
+	}
+	
+	#make sections of right size
+	my $count = ceil(@$index/500); #32Mb sections
+	my $window = ceil(@$index/$count);
+	my @sections = (1..$count);
+	share(@sections); #share is non destructive for forks::shared
+	
+	#preallocate output file size
+	my $tmpfile = ($use_stdout) ? $outfile : "$outfile~"; #add '~' suffix
+	if(!$use_stdout){
+	    sysopen(my $OUT, $tmpfile, O_RDWR|O_CREAT|O_TRUNC) or die "ERROR: Could not open output file $outfile: $!";
+	    close($OUT);
+	    truncate($tmpfile, $osize);
+	}
+
+	#run all threads on data
+	my @threads;
+	my %param = (INDEX => $index, WINDOW => $window, OFFSET => $doff, 
+		     OSIZE => $osize, SECTIONS => \@sections, INFILE => $infile, OUTFILE => $tmpfile);
+	for(my $i = 1; $i < $cpus; $i++){
+	    my $thr = threads->new({'context' => 'scalar'}, \&thread_unzip, \%param);
+	    push(@threads, $thr);
+	}
+	thread_unzip(\%param); #let main process join in
+	
+	#wait on threads
+	$_->join foreach(@threads); #wait on threads
+	
+	#move file to final location
+	if(! $use_stdout){
+	    File::Copy::move($tmpfile, $outfile) or die "ERROR: Could not move output file: $!\n";
+	} 
+	#unlink($infile) if(-f $outfile && (stat($outfile))[7] == $osize);
+	
+	#finished
+	next;
+    }
+}
+
+###run what's left with gzip
+if(@gzip){
+    my $count = scalar(@gzip);
+    my @sections = (1..$count);
+    share(@sections);
+
+    #run all threads on data
+    my @threads;
+    my %param = (SECTIONS => \@sections, INDEX => \@gzip, D_MODE => $d_mode);
+    $cpus = $count if($count < $cpus);
+    for(my $i = 1; $i < $cpus; $i++){
+	my $thr = threads->new({'context' => 'scalar'}, \&thread_gzip, \%param);
+	push(@threads, $thr);
+    }
+    thread_gzip(\%param);
+
+    $_->join foreach(@threads);
+}
+
+#terminate
+exit(0);
+    
+#------------------------------------------------------------------------------
+#-------------------------------- SUBROUTINES ---------------------------------
+#------------------------------------------------------------------------------
+{my %T_BGZF;
+sub gzf_type {
+    my $bgzf = shift;
+
+    #return if file type already known
+    $bgzf = abs_path($bgzf);
+    my $type = $T_BGZF{$bgzf};
+    return $type if(defined($type));
+
+    #open file
+    sysopen(my $IN, $bgzf, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $bgzf: $!";
+
+    #read first block header
+    my $stat = sysread($IN, my $data, 16, 0);
+    die "ERROR: Failure to read BAM stream\n" if($stat != 16);
+
+    #use header to validate format
+    my ($id1,$id2,$cm,$flg,$mtime,$xfl,
+	$os,$xlen,$si1,$si2,$slen) = unpack('CCCCVCCvCCv', $data);
+
+    if($id1 != 31 || $id2 != 139){ #unknown file type
+	$type = 0;
+    }
+    elsif($cm == 8 && $flg == 4 && $xlen == 6 && $si1 == 66 && $si2 == 67 && $slen == 2){ #BGZF
+	$type = 2;
+    }
+    else{ #other Gzip
+	$type = 1;
+    }
+    $IS_BGZF{abs_path($bgzf)} = $type;
+
+    return $type;
+}}
+
+sub is_gzf {
+    return (gzf_type(@_)) ? 1 : 0;
+}
+
+sub is_bgzf {
+    return (gzf_type(@_) == 2) ? 1 : 0;
+}
+
+sub thread_gzip {
+    my $param = shift;
+
+    #fix thread signalling
+    if(is_thread){
+	binmode(STDIN);
+	binmode(STDOUT);
+	select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+	select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+	
+	$SIG{'__DIE__'} = sub {print STDERR  "$_[0]\n"; exit(255)};
+	$SIG{INT} = sub {exit(130)};
+    }
+
+    #load parameters
+    my $sections = $param->{SECTIONS};
+    my $index    = $param->{INFILE};
+    my $d_mode   = $param->{D_MODE};
+
+    while(my $section = shift @$sections){
+	my $set = $index->[$section];
+	run_gzip(@$set, $d_mode)
+    }
+
+    return;
+}
+
+sub run_gzip {
+    my $infile = shift;
+    my $outfile = shift;
+    my $extra = shift;
+    my $d_mode  = shift;
+
+    my $use_stdin  = 1 if(-c $infile);
+    my $use_stdout = 1 if(-c $outfile);
+    my $tmpfile = "$outfile~"; #add '~' suffix
+    
+    #make gzip command
+    my $cmd = 'gzip';
+    $cmd .- ' -d' if($d_mode);
+    $cmd .- ' -c'; 
+    $cmd .= " $infile" if(!$extra && !$use_stdin);
+    $cmd .= " > $tmpfile" if(!$use_stdout);
+    
+    #run gzip
+    if($extra || $use_stdin){ #send data line by line to gzip
+	open(my $EXE, "|$cmd") or die "ERROR: Could not open Gzip to process non-BGZF file: $!";
+	print $EXE $extra;
+	while(read(STDIN, my $buffer, 33554432, 0)){
+	    print $EXE $buffer;
+	}
+	close($EXE);
+	die "ERROR: Gzip failed with exit status: $?\n" if($? != 0); #failure
+    }
+    else{ #let gzip handle it
+	system($cmd);
+	die "ERROR: Gzip failed with exit status: $?\n" if($? != 0); #failure
+    }
+
+    #move file into place
+    if(!$use_stdout){
+	File::Copy::move($tmpfile, $outfile) or die "ERROR: Could not move output file: $!\n";
+    }
+}
+
+sub run_bgzip {
+    my $infile  = shift;
+    my $outfile = shift;
+    my $extra   = shift;
+    my $d_mode  = shift;
+
+    my $use_stdin  = 1 if(-c $infile);
+    my $use_stdout = 1 if(-c $outfile);
+    my $tmpfile = "$outfile~"; #add '~' suffix
+    
+    #make gzip command
+    my $cmd = 'bgzip';
+    $cmd .- ' -d' if($d_mode);
+    $cmd .- ' -c';
+    $cmd .= " $infile" if(!$extra && !$use_stdin);
+    $cmd .= " > $tmpfile" if(!$use_stdout);
+    
+    #run bgzip
+    if($extra || $use_stdin){ #send data line by line to gzip
+	open(my $EXE, "|$cmd") or die "ERROR: Could not open Gzip to process non-BGZF file: $!";
+	print $EXE $extra;
+	while(read(STDIN, my $buffer, 33554432, 0)){
+	    print $EXE $buffer;
+	}
+	close($EXE);
+	die "ERROR: Gzip failed with exit status: $?\n" if($? != 0); #failure
+    }
+    else{ #let gzip handle it
+	system($cmd);
+	die "ERROR: Gzip failed with exit status: $?\n" if($? != 0); #failure
+    }
+
+    #move file into place
+    if(!$use_stdout){
+	File::Copy::move($tmpfile, $outfile) or die "ERROR: Could not move output file: $!\n";
+    }
+}
+
+sub gzi2index {
+    my $bgzf = shift;
+    my $gzi = shift;
+
+    #fill in valiues from gzi
+    my @index;
+    sysopen(my $GI, $gzi, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $gzi: $!";
+    my $data;
+    my $len = (stat($gzi))[7];
+    my $stat = sysread($GI, $data, $len, 0);
+    die "ERROR: Could not read GZI index file $gzi:$!\n" if(!defined($stat) || $stat != $len);
+    close($GI);
+
+    #first 8 bytes contain block entry count 
+    my $soffset = 0;
+    my $nblocks = unpack('q<', substr($data, $soffset, 8));
+    $soffset += 8;
+    die "ERROR: GZI index is empty\n" if($nblocks == -1);
+    die "ERROR: GZI index appears to be corrupt\n" if($len != 8+$nblocks*16);
+    
+    #add block entries from index
+    push(@index, [0, undef, 0, undef]); #first block is always implicit
+    for(my $i = 1; $i <= $nblocks; $i++){
+	my ($boffset, $ioffset) = unpack('q<q<', substr($data, $soffset, 16));
+	$soffset += 16;
+	$index[-1][1] = $boffset - $index[-1][0];
+	$index[-1][3] = $ioffset - $index[-1][2];
+	
+	push(@index, [$boffset, undef, $ioffset, undef]);
+    }
+
+    #last block is always incomplete and must be read from bgzf file
+    sysopen(my $IN, $bgzf, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $bgzf: $!";
+    sysseek($IN, $index[-1][0], SEEK_SET); 
+
+    #determine remaining index values direct from bgzf file
+    $stat = sysread($IN, $data, 18, 0);
+    die "ERROR: Failure to read BAM stream\n" if($stat != 18);
+	
+    #validate header
+    my ($id1,$id2,$cm,$flg,$mtime,$xfl,$os,
+	$xlen, $si1,$si2,$slen,$bsize) = unpack('CCCCVCCvCCvv', $data);
+    die "ERROR: Incorrect header at indicated offset. GZI index may be corrupt.\n"
+	if($id1 != 31 || $id2 != 139 || $cm != 8 || $flg != 4 || $xlen != 6 ||
+	   $si1 != 66 || $si2 != 67 || $slen != 2 || $bsize < 1 || $bsize > 65536+2+6+19);
+
+    #skip compression block
+    my $c_data_size = $bsize-$xlen-19; #compression block size
+    sysseek($IN, $c_data_size, SEEK_CUR);
+	
+    #read footer
+    $stat = sysread($IN, $data, 8, 0);
+    die "ERROR: Failure to read BAM stream\n" if($stat != 8);
+    my ($crc32, $isize) = unpack('L<L<', $data);
+	
+    #potentially corrupt bsize? Sometimes happens when compressed size is more than uncompressed size
+    if($isize > 65536){
+	my $move = -$c_data_size - 8; #move back from current position 
+	
+	#off by 65536 is most common error
+	$bsize += 65536;
+	$c_data_size += 65536;
+	
+	#move forward accoding to new bsize
+	$move += $c_data_size;
+	sysseek($IN, $move, SEEK_CUR);
+	
+	#read footer
+	$stat = sysread($IN, $data, 8, 0);
+	die "ERROR: Failure to read BAM stream\n" if($stat != 8);
+	($crc32, $isize) = unpack('L<L<', $data);
+	
+	die "ERROR: Corrupt compression block\n" if($isize > 65536);
+    }
+
+    #complete last block entry
+    $index[-1][1] = $bsize+1;
+    $index[-1][3] = $isize;
+
+    #add implicit EOF block entry
+    my $boffset = $index[-1][0]+$index[-1][1];
+    my $ioffset = $index[-1][2]+$index[-1][3];
+    push(@index, [$boffset, 28, $ioffset, 0]) if((stat($bgzf))[7] > $boffset);
+
+    #verify final size matches index expectation
+    if($index[-1][0]+$index[-1][1] != (stat($bgzf))[7]){
+	die "ERROR: File size does not match index. GZI file may be corrupt\n";
+    }
+
+    return \@index;
+}
+
+sub write_gzi {
+    my $index = shift;
+    my $gzi = shift;
+
+    sysopen(my $OUT, $gzi, O_RDWR|O_CREAT|O_TRUNC|O_BINARY) or die "ERROR: Could not open output file $gzi: $!";
+    
+    my $nblocks = @$index ? scalar(@$index)-2 : -1; #ignore implicit first and last block entries
+    my $data = pack('q<', $nblocks); #add count
+    
+    #add each index entry
+    for(my $i = 1; $i < @$index-1; $i++){
+	$data .= pack('q<q<', $index->[$i][0], $index->[$i][2]);
+    }
+
+    syswrite($OUT, $data);
+    close($OUT);
+}
+
+sub thread_index {
+    my $param = shift;
+    
+    #fix thread signalling
+    if(is_thread){
+	binmode(STDIN);
+	binmode(STDOUT);
+	select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+	select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+
+	$SIG{'__DIE__'} = sub {print STDERR  "$_[0]\n"; exit(255)};
+	$SIG{INT} = sub {exit(130)};
+    }
+
+    #load parameters
+    my $window   = $param->{WINDOW};
+    my $isize    = $param->{ISIZE};
+    my $sections = $param->{SECTIONS};
+    my $infile   = $param->{INFILE};
+
+    #open input file
+    sysopen(my $IN, $infile, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $infile: $!";
+
+    #now read sections
+    my %indexes;
+    while(my $section = shift @$sections){
+	my $index = $indexes{$section} = [];
+	my $start = ($section-1) * $window;
+	my $end   = $section * $window;
+	$end = $isize if($end > $isize); #don't go past end
+
+	#move to first block in section
+	my $pos = seek_next_block($IN, $start, SEEK_SET);
+	die "ERROR: Could not find start of block in section\n" if($pos >= $end);
+
+	#read in entire section
+	my $dlen = $end - $start + 65536; #data length with overhang of one block
+	sysread($IN, my $data, $dlen, 0); #read in entire section
+
+	#determine remaining index values direct from bgzf file
+	my $boffset = $pos;
+	my $ioffset = 0;
+	while(1){
+	    my $header = substr($data, 0, 18, '');
+	    die "ERROR: Failure to read BAM stream\n" if(length($header) != 18);
+	    $pos += 18; #update position relative to file
+
+	    #validate header
+	    my ($id1,$id2,$cm,$flg,$mtime,$xfl,$os,
+		$xlen, $si1,$si2,$slen,$bsize) = unpack('CCCCVCCvCCvv', $header);
+	    die "ERROR: Incorrect header at indicated offset. GZI index may be corrupt.\n"
+		if($id1 != 31 || $id2 != 139 || $cm != 8 || $flg != 4 || $xlen != 6 ||
+		   $si1 != 66 || $si2 != 67 || $slen != 2 || $bsize < 1 || $bsize > 65536+2+6+19);
+	    
+	    #skip compression block
+	    my $c_data_size = $bsize-$xlen-19; #compression block size
+	    substr($data, 0, $c_data_size, ''); #drop compression block
+	    $pos += $c_data_size;
+	    
+	    #read footer
+	    my $footer = substr($data, 0, 8, '');
+	    die "ERROR: Failure to read BAM stream\n" if(length($footer) != 8);
+	    my ($crc32, $isize) = unpack('L<L<', $footer);
+	    $pos += 8;
+
+	    #potentially corrupt bsize? Sometimes happens when compressed size is more than uncompressed size
+	    if($isize > 65536){
+		my $move = -$c_data_size - 8; #move back from current position 
+		
+		#off by 65536 is most common error
+		$bsize += 65536;
+		$c_data_size += 65536;
+		
+		#move forward accoding to new bsize
+		$move += $c_data_size;
+		substr($data, 0, $move, ''); #drop compression block
+		$pos += $move;
+		
+		#read footer
+		$footer = substr($data, 0, 8, '');
+		die "ERROR: Failure to read BAM stream\n" if(length($footer) != 8);
+		($crc32, $isize) = unpack('L<L<', $footer);
+		$pos += 8;
+		
+		die "ERROR: Corrupt compression block\n" if($isize > 65536);
+	    }
+	    
+	    #make index entry for block
+	    push(@$index, [$boffset, $bsize+1, $ioffset, $isize]);
+	    $boffset += $bsize+1;
+	    $ioffset += $isize;
+
+	    last if($pos >= $end);
+	}
+    }
+    close($IN);
+
+    return \%indexes;
+}
+
+#main fastq conversion done here by each process
+sub thread_unzip {
+    my $param = shift;
+
+    #fix thread signalling
+    if(is_thread){
+	binmode(STDIN);
+	binmode(STDOUT);
+	select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+	select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+
+	$SIG{'__DIE__'} = sub {print STDERR  "$_[0]\n"; exit(255)};
+	$SIG{INT} = sub {exit(130)};
+    }
+
+    #load parameters
+    my $index = $param->{INDEX};
+    my $window = $param->{WINDOW};
+    my $infile = $param->{INFILE};
+    my $outfile = $param->{OUTFILE};
+    my $sections = $param->{SECTIONS};
+    my $doff = $param->{OFFSET};
+    my $osize = $param->{OSIZE};
+    my $validate = 1;
+
+    #open input file
+    sysopen(my $IN, $infile, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $infile: $!";
+
+    #open output file
+    sysopen(my $OUT, $outfile, O_RDWR|O_BINARY) or die "ERROR: Could not open output file $outfile: $!";
+
+    #now read alignment sections
+    while(my $section = shift @$sections){
+	my $start = ($section-1) * $window;
+	my $end   = $section * $window;
+	$end = scalar(@$index) if($end > @$index); #don't go past end
+
+	#move to position in input and output file for section
+	my ($boffset, $ioffset) = ($index->[$start][0], $index->[$start][2]);
+	sysseek($IN, $boffset, SEEK_SET);
+	if(defined($doff)){
+	    my $alt = ($ioffset > $doff) ? $ioffset-$doff : 0;
+	    sysseek($OUT, $alt, SEEK_SET);
+	}
+	else{
+	    sysseek($OUT, $ioffset, SEEK_SET);
+	}
+
+	#inflate all blocks in section
+	my $buffer = '';
+	my $dlen = ($index->[$end-1][0]+$index->[$end-1][1]) - $index->[$start][0];
+	sysread($IN, my $data, $dlen, 0); #read in entire section
+	for(my $i = $start; $i < $end; $i++){
+	    inflate(\ (substr($data, 0, $index->[$i][1], '')),
+		    \$buffer,
+		    $validate);
+	}
+
+	#trim buffer when desired offset and size specified
+	if(defined($doff)){
+	    #buffer has trailing data that needs to be trimmed
+	    if($doff+length($buffer) > $osize){
+		my $trim = ($doff+length($buffer)) - $osize;
+		substr($buffer, -$trim, $trim, '');
+	    }
+	    
+	    #buffer has leading data that needs to be trimmed
+	    if($ioffset < $doff){
+		my $trim = $doff - $ioffset;
+		substr($buffer, 0, $trim, '');
+	    }
+	}
+
+	#write to file
+	syswrite($OUT, $buffer);
+    }
+    close($OUT);
+    close($IN);
+    
+    return;
+}
+
+#main fastq conversion done here by each process
+sub thread_zip {
+    my $param = shift;
+
+    #fix thread signalling
+    if(is_thread){
+	binmode(STDIN);
+	binmode(STDOUT);
+	select((select(STDOUT), $|=1)[0]); #make STDOUT buffer flush immediately
+	select((select(STDERR), $|=1)[0]); #make STDERR buffer flush immediately
+
+	$SIG{'__DIE__'} = sub {print STDERR  "$_[0]\n"; exit(255)};
+	$SIG{INT} = sub {exit(130)};
+    }
+
+    #load parameters
+    my $isize = $param->{ISIZE};
+    my $osize = $param->{OSIZE};
+    my $window = $param->{WINDOW};
+    my $infile = $param->{INFILE};
+    my $outfile = $param->{OUTFILE};
+    my $sections = $param->{SECTIONS};
+    my $ipc_share = $param->{IPC_SHARE};
+    my $validate = 1;
+
+    #open input file
+    sysopen(my $IN, $infile, O_RDONLY|O_BINARY) or die "ERROR: Could not open input file $infile: $!";
+
+    #open output file
+    sysopen(my $OUT, $outfile, O_RDWR|O_BINARY) or die "ERROR: Could not open output file $outfile: $!";
+
+    #now read alignment sections
+    my %buffer;
+    while(my $section = shift @$sections){
+	my $start = ($section-1) * $window;
+	my $end   = $section * $window;
+	$end = scalar($isize) if($end > $isize); #don't go past end
+
+	#move to position in input and output file for section
+	sysseek($IN, $start, SEEK_SET);
+
+	#inflate all blocks in section
+	$buffer{$section} = '';
+	sysread($IN, my $data, $end-$start, 0); #grabs compression block and footer
+	deflate(\ (substr($data, 0, 65280, '')), \ ($buffer{$section})) while(length($data));
+
+	#print any buffered sections
+	foreach my $key (sort {$a <=> $b} keys %buffer){
+	    last unless(defined($ipc_share->[$key-1])); #needed for ordered offset
+
+	    #extend file if needed
+	    my $soff = $ipc_share->[$key-1] + length($buffer{$key});
+	    if($soff > $osize){
+		truncate($OUT, $soff);
+		$osize = $soff;
+	    }
+
+	    #set ordered offset and write data
+	    $ipc_share->[$key] = $soff;
+	    sysseek($OUT, $ipc_share->[$key-1], SEEK_SET);
+	    syswrite($OUT, $buffer{$key});
+	    delete($buffer{$key});
+	}
+    }
+    close($IN);
+
+    #print any remaining buffered sections
+    foreach my $key (sort {$a <=> $b} keys %buffer){
+	sleep 0.1 while(!defined($ipc_share->[$key-1])); #needed for ordered offset
+	
+	#set ordered offset and write data
+	$ipc_share->[$key] = $ipc_share->[$key-1] + length($buffer{$key});
+	sysseek($OUT, $ipc_share->[$key-1], SEEK_SET);
+	syswrite($OUT, $buffer{$key});
+	delete($buffer{$key});
+    }
+    close($OUT);
+    
+    return;
+}
+
+sub seek_next_block {
+    my $FH = shift; #filehandle
+    my $start = shift; #where to start looking from
+    my $wence = shift || SEEK_SET; #(SEEK_SET, SEEK_CUR, SEEK_END)
+
+    #not enough space left for a block
+    my $size = (stat($FH))[7]; #file size
+    return sysseek($FH, $size, SEEK_SET) if($size-$start < 28);
+
+    #go to starting search position
+    my $pos = sysseek($FH, $start, $wence);
+
+    #read in some data to check
+    my $data;
+    sysread($FH, $data, 65536, 0); #max block
+
+    #scan string for block header
+    my $offset = find_block_offset(\$data, 0);
+    return sysseek($FH, $size, SEEK_SET) if($offset == -1);
+
+    #adjust file position with new offset and return
+    $pos += $offset;
+    return sysseek($FH, $pos, SEEK_SET);
+}
+
+sub find_block_offset {
+    my $ref = shift;
+    my $offset = shift || 0;
+
+    #find block keys in data
+    my $key1 = pack('H8', '1f8b0804'); #4 byte static header key
+    my $key2 = pack('H12', '060042430200'); #key1, 6 non-static bytes, then key2 (6 bytes)
+    while(1){
+        #match first static key
+        $offset = index($$ref, $key1, $offset);
+        return -1 if($offset == -1);
+
+        #match second static key
+        my $offset2 = index($$ref, $key2, $offset);
+        return -1 if($offset2 == -1);
+
+        #second match must be 10 bytes from first offset (4 byte key1 and 6 byte gap)
+        if($offset2-$offset == 10){
+            last;
+        }
+        else{
+            $offset += 4; #jump over key1 match and try again
+        }
+    }
+
+    return $offset;
+}
+
+sub inflate {
+    my $buffer = shift; #reference
+    my $ref    = shift; #reference
+    my $validate = shift;
+
+    return if(!$buffer);
+
+    my ($i_obj, $stat) = inflateInit(-WindowBits => -15, -Bufsize => 131072);
+    die "ERROR: Failed to create zlib inflation object with status: $stat\n" if($stat);
+
+    substr($$buffer, 0, 18, '');
+    $$ref .= scalar($i_obj->inflate($buffer));
+
+    #validate the length and crc32
+    if($validate){
+        my ($crc32, $isize);
+        if(ref($ref)){
+            ($crc32, $isize) = unpack('L<L<', $$buffer);
+	}
+        else{
+            ($crc32, $isize) = unpack('L<L<', $buffer);
+        }
+	
+        if($isize != $i_obj->total_out()){ #size does not match
+            die "ERROR: The expected ISIZE of the uncompressed block does not match\n";
+        }
+	if($crc32 != crc32(substr($$ref, -$isize, $isize))){ #crc32 does not match
+            die "ERROR: The expected CRC32 of the uncompressed block does not match\n";
+        }
+    }
+
+    return;
+}
+
+sub deflate {
+    my $buffer = shift; #reference
+    my $ref = shift; #reference
+
+    my ($d_obj, $stat) = deflateInit(-WindowBits => -15, -Bufsize => 131072, -Level => 4);
+    die "ERROR: Failed to create zlib deflation object with status: $stat\n" if($stat);
+
+    my $offset = length($$ref);
+    $$ref .= pack('H36', '1f8b08040000000000ff0600424302000000'); #header (BSIZE=0)
+    $$ref .= scalar($d_obj->deflate($buffer)).scalar($d_obj->flush); #compressed data
+    $$ref .= pack('V', crc32($buffer)); #CRC32
+    $$ref .= pack('V', $d_obj->total_in()); #ISIZE
+    substr($$ref, $offset+16, 2, pack('v', $d_obj->total_out+6+19)); #set final BSIZE
+
+    return;
+}
+
+sub eof_block {
+    return pack('H56', '1f8b08040000000000ff0600424302001b0003000000000000000000');
+}
+
+#convenience method to see if I am in a thread or not
+{my $tid; BEGIN{$tid = threads->tid if exists $INC{'threads.pm'}};
+sub is_thread {
+    my $is_thread = 1 if(defined($tid) && $tid != threads->tid);
+    return $is_thread;
+}}

@@ -1,0 +1,284 @@
+NAME
+    BGZFast::bgzf_manipulator - Manipulation of BGZF file structure
+
+SYNOPSIS
+      use BGZFast::bgzf_manipulator;
+
+      # Jump to start of a BGZF block using real file
+      my $obj = BGZFast::bgzf_manipulator->new('/path/to/file.gz');
+      my ($real, $virtual) = $obj->smart_seek(10_000_000); #pos is real file
+      my $block = $obj->current_block();
+
+      # Move to position using virtual file
+      ($real, $virtual) = $obj->pos_seek(10_000_000); #pos is in virtual file
+      $block = $obj->current_block();
+
+      # Get position from index file
+      ($real, $virtual) = $obj->query_index(10_000_000);
+      $obj->block_seek($real, $virtual); #move to position
+
+      # Scan for desired contents and get offsets overlapping content
+      my $buffer = $obj->vbuffer();
+      $obj->grow_vbuffer();
+      my $off = index($$buffer, "\n", $boff);
+      $obj->vbuffer_offset($off);
+      ($real, $virtual) = $obj->block_tell();
+
+      #read blocks one after the other and write to file handle
+      while(my $block = $obj->next_block){
+         print $obj->write_block($OUT, $block);
+      }
+
+DESCRIPTION
+    BGZFast::bgzf_manipulator provides a mechanism to easilly navegate and
+    manipulate BGZF file structure as opposed to manipulation of content.
+    This allows BGZF files to be shattered and partitioned for parallel
+    processing and streaming of blocks.
+
+INDEXING
+    Indexing can be performed using the $obj->make_index method
+
+SEE ALSO
+    BGZFast::bgzf_utility
+
+AUTHOR
+    Carson Holt <carson.holt@genetics.utah.edu>.
+
+    Copyright (c) 2017 University of Utah.
+
+    This library is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself. See DISCLAIMER.txt for disclaimers
+    of warranty.
+
+APPENDIX
+    The rest of the documentation details each of the object methods.
+    Internal methods are usually preceded with a _
+
+
+    For simple access, the following methods are provided:
+
+  new
+     Title   : new
+     Usage   : my $obj = BGZFast::bgzf_manipulator->new($path, %options);
+     Function: Initialize a new file manipulator object.
+     Returns : A new BGZFast::bgzf_manipulator object.
+     Args    : A single BGZF file (or regular file if setting -is_bgzf => 0)
+               Optional arguments:
+
+     Option        Description                                         Default
+     -----------   -----------                                         -------
+     -is_bgzf      Indicates whether a file is in BGZF format          1
+     -cpus         How many CPUs to use on paralelizable operations    1
+
+  file
+     Title   : file
+     Usage   : my $path = $obj->file;
+     Function: Get the path to the BGZF file encapsulated by this object.
+     Returns : String
+     Args    : None
+
+  close_handle
+     Title   : close_handle
+     Usage   : $obj->close_handle;
+     Function: Closes open file handle in object. Should before creating
+               threads or forking.
+     Returns : True on success
+     Args    : None
+
+  reset_handle
+     Title   : close_handle
+     Usage   : $obj->reset_handle;
+     Function: Close and reopen file handle in object. Use after creating
+               threads or forking if close_handle was not called.
+     Returns : True on success
+     Args    : None
+
+  fill_io_buffer
+     Title   : fill_io_buffer
+     Usage   : $obj->fill_io_buffer($bytes);
+     Function: Fill IO buffer for reading with given number of bytes. Methods
+               like next_block read from this buffer. Usful to avoid multiple
+               read operations if you expect to process all blocks in a large
+               segment of a file.
+     Returns : Size of IO buffer after fill
+     Args    : Number of bytes (defaults to 65536 or 64kb when empty)
+
+  size_io_buffer
+     Title   : size_io_buffer
+     Usage   : $size = $obj->size_io_buffer();
+     Function: Get current length of IO buffer
+     Returns : Size of IO buffer
+     Args    : None
+
+  vbuffer
+     Title   : vbuffer
+     Usage   : my $vbuffer = $obj->vbuffer()
+     Function: Provides access to the virtual buffer data string.
+     Returns : A string reference.
+     Args    : None
+
+  vbuffer_offset
+     Title   : vbuffer_offset
+     Usage   : my $offset = $obj->vbuffer_offset(); #get current offset
+               $obj->vbuffer_offset($offset); #move to given offset
+               $obj->vbuffer_offset(0, SEEK_SET); #start of buffer
+               $obj->vbuffer_offset(0, SEEK_END); #end of buffer
+               $obj->vbuffer_offset(0, SEEK_CUR); #keeps current position
+     Function: Get/set the offset in the virtual buffer. Will automaticaly
+               trim blocks off of the virtual buffer if offset is set more
+               than 64kb from the start. See Fcntl for wence values.
+     Returns : Final buffer offset
+     Args    : Number (negative numbers count backwards just as with seek)
+               Wence (optional. values: SEEK_SET, SEEK_CUR, SEEK_END)
+
+  grow_vbuffer
+     Title   : grow_vbuffer
+     Usage   : $obj->grow_vbuffer();
+     Function: Adds next block in file to the virtual buffer without altering
+               current buffer or block offset.
+     Returns : Number (length of virtual buffer)
+     Args    : Number (Optional target length to add to virtual buffer)
+
+  index
+     Title   : index
+     Usage   : $obj->index();
+     Function: Get/build the index object. Builds and parses index if object
+               does not yet exist.
+     Returns : Index object.
+     Args    : None
+
+  index_file
+     Title   : index_file
+     Usage   : $path = $obj->index_file();
+               $path = $obj->index_file($file);
+     Function: Get expected/observed path to index file
+     Returns : Path of index file
+     Args    : Path (optional path of file to index. defaults to current file)
+
+  make_index
+     Title   : make_index
+     Usage   : $path = $obj->make_index();
+               $path = $obj->make_index($file);
+     Function: Make index of file. Calls to external indexer. Can Parallelize
+               if CPUS specified in parameters given to 'new'.
+     Returns : Path of index file (undef on failure)
+     Args    : Path (optional path of file to index. defaults to current file)
+
+  parse_index
+     Title   : parse_index
+     Usage   : $obj->parse_index();
+               $obj->parse_index($index_file);
+     Function: Parse given index of file.
+     Returns : True on success
+     Args    : Path (optional path of index. defaults to $obj->index_file)
+
+  write_index
+     Title   : write_index
+     Usage   : $obj->write_index();
+               $obj->write_index($file);
+     Function: Write index to a file.
+     Returns : True on success
+     Args    : Path (optional write path. defaults to $obj->index_file)
+
+  query_index
+     Title   : query_index
+     Usage   : ($real, $virtual) = $obj->query_index($pos);
+     Function: Get real and virtual file offsets corresponding to the
+               position query
+     Returns : Real and virtual file offsets (just real in scalar context)
+     Args    : Position to search index for (virtual for GZI)
+
+  current_block
+     Title   : current_block
+     Usage   : $block = $obj->current_block();
+     Function: Get block overlapping current virtual buffer / block offsets
+     Returns : block object
+     Args    : None
+
+  next_block
+     Title   : next_block
+     Usage   : $block = $obj->next_block();
+     Function: Get next block in file. Will move virtual buffer / block
+               offsets to the start of this new block.
+     Returns : block object
+     Args    : None
+
+  block_head
+     Title   : block_head
+     Usage   : $block = $obj->block_head();
+     Function: Shatter the block overlapping the current virtual buffer /
+               block offsets and return a new block of data upstream of the
+               offsets.
+     Returns : block object
+     Args    : None
+
+  block_tail
+     Title   : block_head
+     Usage   : $block = $obj->block_tail();
+     Function: Shatter the block overlapping the current virtual buffer /
+               block offsets and return a new block of data downstream of the
+               offsets.
+     Returns : block object
+     Args    : None
+
+  write_block
+     Title   : write_block
+     Usage   : $obj->write_block($FH);
+     Function: Write a given block to a given file handle.
+     Returns : Bytes written (undef on failure with $! set)
+     Args    : File handle to write to
+               Block object to write
+
+  write_as_blocks
+     Title   : write_as_blocks
+     Usage   : $obj->write_as_blocks($FH);
+     Function: Compress a given string into BGZF blocks and write them to a
+               given file handle.
+     Returns : Bytes written (undef on failure with $! set)
+     Args    : File handle to write to
+               String/String ref
+
+  write_eof_block
+     Title   : write_eof_block
+     Usage   : $obj->write_eof_block($FH);
+     Function: Write an EOF block to a given file handle.
+     Returns : Bytes written (undef on failure with $! set)
+     Args    : File handle to write to
+
+  write_section
+     Title   : write_section
+     Usage   : $obj->write_section($file_path, $vstart, $vend);
+     Function: Will write all data between two virtual position boundaries
+               to the given file handle. Will trim blocks around start and
+               end positions appropriately and add eof block. 
+     Returns : Bytes written (undef on failure with $! set)
+     Args    : File path to write to
+               Start position
+               End position
+
+  block_seek
+     Title   : block_seek
+     Usage   : $obj->block_seek($reak, $virtual);
+     Function: Move to a given real and virtual offset in a BGZF file.
+     Returns : Real and virtual offset moved to (just real offset in scalar
+               context)
+     Args    : Real file offset
+               Virtual file offset
+
+  block_tell
+     Title   : block_tell
+     Usage   : ($real, $virtual) = $obj->block_seek()
+     Function: Get current real and virtual offsets in a BGZF file.
+     Returns : Real and virtual offsets (just real offset in scalar context)
+     Args    : None
+
+  smart_seek
+     Title   : block_tell
+     Usage   : ($real, $virtual) = $obj->smart_seek($pos)
+               ($real, $virtual) = $obj->smart_seek($pos, SEEK_SET);
+     Function: Move to a given position and auto adjust to start of the next
+               BGZF block in the file. See Fcntl for wence options.
+     Returns : Real and virtual offsets (just real offset in scalar context)
+     Args    : Number (negative will count backwards just lie seek)
+               Wence (optional. values: SEEK_SET, SEEK_CUR, SEEK_END)
+
