@@ -35,7 +35,6 @@ use Config;
 use DynaLoader;
 use File::Copy;
 use File::Path;
-use File::Which;
 use File::Basename;
 use IPC::Open3;
 
@@ -90,7 +89,7 @@ sub config_hts {
     my $tabix = "$ebase/htslib/bin/tabix" if(-f "$ebase/htslib/bin/tabix");
     ($tabix) = grep {/(^|[\/])tabix$/} (<$base/../exe/*/*>, <$base/../exe/*/bin/*>) if(!$tabix);
     $tabix = $self->config('tabix') if(! $tabix && $self->config('tabix') && $self->config('tabix') =~ /(^|[\/])tabix$/);
-    ($tabix) = File::Which::where('tabix') if(!$tabix || ! -f $tabix);
+    ($tabix) = App::Which::where('tabix') if(!$tabix || ! -f $tabix);
 
     my $htsdir = $tabix || '';
     $htsdir =~ s/\/[^\/]+$//;
@@ -150,7 +149,7 @@ sub config_exe_loc {
     my $base = $self->base_dir;
     my $ebase = $self->install_destination('exe');
     my ($exe) = grep {/(^|[\/])$tag$/ && -f $_} (<$base/../exe/*/*>, <$base/../exe/*/bin/*>);
-    ($exe) = File::Which::where($tag) if(!$exe || ! -f $exe);
+    ($exe) = App::Which::where($tag) if(!$exe || ! -f $exe);
     $exe = $self->prompt("\nPlease specify the path to '$tag' on your system:", $exe);
     if(!$exe){
 	print "Skipping '$tag'...\n";
@@ -484,7 +483,7 @@ sub ACTION_commit {
 sub ACTION_release {
     my $self = shift;
 
-    File::Which::which('tar') || die "ERROR: Cannot find tar to build the release\n";
+    App::Which::which('tar') || die "ERROR: Cannot find tar to build the release\n";
 
     #update current repository
     print "\nUpdating to most current repository...\n";
@@ -605,7 +604,7 @@ sub exe_failures {
 	my $loc;
 	foreach my $cmd (@cmds){
 	    last if(($loc) = grep {$_ && -f $_} $self->config_data($cmd));
-	    last if(($loc) = grep {-f $_} ("$dest/$cmd", "$dest/bin/$cmd", File::Which::which($cmd)));
+	    last if(($loc) = grep {-f $_} ("$dest/$cmd", "$dest/bin/$cmd", App::Which::which($cmd)));
 	    last if(($loc) = grep {-f $_ && -x $_} ($cmd));
 	}
 
@@ -789,7 +788,7 @@ sub fail {
 sub cpan_install {
     my ($self, $desired, $local) = @_;
 
-    unless(File::Which::which('make')){
+    unless(App::Which::which('make')){
 	die "\n\n".
             "ERROR: Cannot find 'make' on your system. If this is a Mac you will need\n".
 	    "to install Xcode developer tools before you can continue. This can be\n".
@@ -958,7 +957,7 @@ sub extract_archive {
 
     return 0 if(! $file);
     
-    if(File::Which::which('tar')){
+    if(App::Which::which('tar')){
 	my $command;
 	my $u = scalar getpwuid($>);
 	my $g = scalar getgrgid($));
@@ -994,12 +993,12 @@ sub getstore {
     my $user = shift;
     my $pass = shift;
 
-    if(File::Which::which('wget')){ #Linux
+    if(App::Which::which('wget')){ #Linux
 	my $command = "wget $url -c -O $file --no-check-certificate";
 	$command .= " --user $user --password $pass" if(defined($user) && defined($pass));
 	return $self->do_system($command); #gives status and can continue partial
     }
-    elsif(File::Which::which('curl')){ #Mac
+    elsif(App::Which::which('curl')){ #Mac
 	my $command = "curl --connect-timeout 30 -f -L $url -o $file";
 	$command .= " --user $user:$pass" if(defined($user) && defined($pass));
 	my $continue = " -C -";
@@ -1212,7 +1211,7 @@ sub svn_w_args {
     my $self = shift;
     my @args = @_;
 
-    my $svn = File::Which::which("svn");
+    my $svn = App::Which::which("svn");
     die "ERROR: Cannot find the executable 'svn' (subversion respository tool)\n" if(!$svn);
     die "ERROR: Failure to supply a subcommand to subversion\n" if(!@args);
 
@@ -1356,6 +1355,156 @@ sub safe_prompt {
 
     $r = $d if(length($r) == 0);
     return $r; #Return the response
+}
+
+
+#--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------
+
+
+package App::Which;
+
+use strict;
+use warnings;
+use File::Spec ();
+
+# ABSTRACT: Perl implementation of the which utility as an API
+our $VERSION = '1.27'; # VERSION
+
+use constant IS_VMS => ($^O eq 'VMS');
+use constant IS_MAC => ($^O eq 'MacOS');
+use constant IS_WIN => ($^O eq 'MSWin32' or $^O eq 'dos' or $^O eq 'os2');
+use constant IS_DOS => IS_WIN();
+use constant IS_CYG => ($^O eq 'cygwin' || $^O eq 'msys');
+
+our $IMPLICIT_CURRENT_DIR = IS_WIN || IS_VMS || IS_MAC;
+
+# For Win32 systems, stores the extensions used for
+# executable files
+# For others, the empty string is used
+# because 'perl' . '' eq 'perl' => easier
+my @PATHEXT = ('');
+if ( IS_WIN ) {
+  # WinNT. PATHEXT might be set on Cygwin, but not used.
+    if ( $ENV{PATHEXT} ) {
+	push @PATHEXT, split /;/, $ENV{PATHEXT};
+    } else {
+    # Win9X or other: doesn't have PATHEXT, so needs hardcoded.
+	push @PATHEXT, qw{.com .exe .bat};
+    }
+} elsif ( IS_VMS ) {
+    push @PATHEXT, qw{.exe .com};
+} elsif ( IS_CYG ) {
+  # See this for more info
+  # http://cygwin.com/cygwin-ug-net/using-specialnames.html#pathnames-exe
+    push @PATHEXT, qw{.exe .com};
+}
+
+
+sub which {
+    my ($exec) = @_;
+
+    return undef unless defined $exec;
+    return undef if $exec eq '';
+
+    my $all = wantarray;  ## no critic (Freenode::Wantarray)
+    my @results = ();
+
+  # check for aliases first
+    if ( IS_VMS ) {
+	my $symbol = `SHOW SYMBOL $exec`;
+	chomp($symbol);
+	unless ( $? ) {
+	    return $symbol unless $all;
+	    push @results, $symbol;
+	}
+    }
+    if ( IS_MAC ) {
+	my @aliases = split /\,/, $ENV{Aliases};
+	foreach my $alias ( @aliases ) {
+      # This has not been tested!!
+      # PPT which says MPW-Perl cannot resolve `Alias $alias`,
+      # let's just hope it's fixed
+	    if ( lc($alias) eq lc($exec) ) {
+		chomp(my $file = `Alias $alias`);
+		last unless $file;  # if it failed, just go on the normal way
+		return $file unless $all;
+		push @results, $file;
+        # we can stop this loop as if it finds more aliases matching,
+        # it'll just be the same result anyway
+		last;
+	    }
+	}
+    }
+
+  return $exec  ## no critic (ValuesAndExpressions::ProhibitMixedBooleanOperators)
+      if !IS_VMS and !IS_MAC and !IS_WIN and $exec =~ /\// and -f $exec and -x $exec;
+
+    my @path;
+    if($^O eq 'MSWin32') {
+    # File::Spec (at least recent versions)
+    # add the implicit . for you on MSWin32,
+    # but we may or may not want to include
+    # that.
+	@path = split /;/, $ENV{PATH};
+    s/"//g for @path;
+    @path = grep length, @path;
+  } else {
+    @path = File::Spec->path;
+  }
+  if ( $IMPLICIT_CURRENT_DIR ) {
+    unshift @path, File::Spec->curdir;
+  }
+
+  foreach my $base ( map { File::Spec->catfile($_, $exec) } @path ) {
+    for my $ext ( @PATHEXT ) {
+      my $file = $base.$ext;
+
+      # We don't want dirs (as they are -x)
+      next if -d $file;
+
+      if (
+        # Executable, normal case
+        -x _
+        or (
+          # MacOS doesn't mark as executable so we check -e
+          IS_MAC  ## no critic (ValuesAndExpressions::ProhibitMixedBooleanOperators)
+          ||
+          (
+            ( IS_WIN or IS_CYG )
+            and
+	   grep {   ## no critic (BuiltinFunctions::ProhibitBooleanGrep)
+              $file =~ /$_\z/i
+	   } @PATHEXT[1..$#PATHEXT]
+          )
+          # DOSish systems don't pass -x on
+          # non-exe/bat/com files. so we check -e.
+          # However, we don't want to pass -e on files
+          # that aren't in PATHEXT, like README.
+          and -e _
+        )
+	  ) {
+	  return $file unless $all;
+	  push @results, $file;
+      }
+    }
+  }
+
+    if ( $all ) {
+	return @results;
+    } else {
+	return undef;
+    }
+}
+
+
+sub where {
+  # force wantarray
+    my @res = which($_[0]);
+    return @res;
 }
 
 1;

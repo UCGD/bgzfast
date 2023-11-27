@@ -40,6 +40,7 @@ my $build = App::Build->new(
 	'Storable'              => '0.607',
 	'IPC::Semaphore'        => '0',
 	'Scalar::Util'          => '0',
+	'File::Which'           => '0',
 	#'Other::Module' => '>= 1.2, != 1.5, < 2.0',
     },
     build_requires => {
