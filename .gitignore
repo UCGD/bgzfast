@@ -1,0 +1,11 @@
+bin/
+lib/
+man/
+src/BGZFast-tbx_extra.inl
+src/Bio-DB-FAI.inl
+src/Build
+src/MYMETA.json
+src/MYMETA.yml
+src/_Inline/
+src/_build/
+src/blib/
